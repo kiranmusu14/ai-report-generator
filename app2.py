@@ -1,5 +1,3 @@
-# ✅ FIXED & UPDATED VERSION OF app.py (with GrowthRate fix, ETF mapping, and improved prompt)
-
 import openai
 from openai import OpenAIError
 import pandas as pd
@@ -7,7 +5,10 @@ from pytrends.request import TrendReq
 import yfinance as yf
 import spacy
 from xhtml2pdf import pisa
+from io import BytesIO
 import streamlit as st
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import time
 from difflib import get_close_matches
@@ -17,55 +18,51 @@ import requests
 from bs4 import BeautifulSoup
 import os
 from dotenv import load_dotenv
-from reddit_rag_scraper import get_reddit_posts
+from reddit_rag_scraper import get_reddit_posts, get_reddit_posts_with_metadata
 from rag_vector_DB import build_vector_db_from_texts, retrieve_relevant_docs
 
-load_dotenv() 
+load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
-def scrape_investopedia_definition(industry_term):
-    search_query = industry_term.replace(" ", "+")
-    url = f"https://www.investopedia.com/search?q={search_query}"
 
+# ── NLP ────────────────────────────────────────────────────────────────────────
+nlp = spacy.load("en_core_web_sm")
+
+# ── Utility functions ──────────────────────────────────────────────────────────
+
+def scrape_investopedia_definition(industry_term):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # Get first result link
+        url = f"https://www.investopedia.com/search?q={industry_term.replace(' ', '+')}"
+        soup = BeautifulSoup(requests.get(url, headers=headers).text, "html.parser")
         result = soup.select_one("a[data-analytics-label='search-result']")
         if not result:
             return f"No Investopedia article found for '{industry_term}'."
-
-        article_url = result["href"]
-        article_response = requests.get(article_url, headers=headers)
-        article_soup = BeautifulSoup(article_response.text, "html.parser")
-
-        # Extract summary paragraph
-        paragraph = article_soup.find("p")
-        return paragraph.text.strip() if paragraph else "No summary found."
-
+        article_soup = BeautifulSoup(
+            requests.get(result["href"], headers=headers).text, "html.parser"
+        )
+        p = article_soup.find("p")
+        return p.text.strip() if p else "No summary found."
     except Exception as e:
-        return f"⚠️ Error scraping Investopedia: {e}"
+        return f"Error scraping Investopedia: {e}"
 
 
-# 🔹 Web Scraping: Google News Headlines
 def scrape_google_news(industry):
     try:
-        query = industry.replace(" ", "+")
-        url = f"https://news.google.com/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
+        url = f"https://news.google.com/search?q={industry.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+        soup = BeautifulSoup(
+            requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text, "html.parser"
+        )
         articles = soup.select("article h3")
         return [a.get_text() for a in articles[:5]] if articles else ["No Google News results."]
     except Exception as e:
-        return [f"⚠️ Google News scrape failed: {e}"]
+        return [f"Google News scrape failed: {e}"]
 
-# 🔹 Web Scraping: Statista Placeholder (since real-time scraping often blocked)
+
 def get_statista_placeholder(industry):
-    # Simulate or return static sample for now
-    return f"According to Statista, the {industry} industry is expected to grow steadily, with digital adoption and AI integration being key drivers."
+    return (
+        f"According to Statista, the {industry} industry is expected to grow steadily, "
+        "with digital adoption and AI integration being key drivers."
+    )
 
 
 def normalize_industry_term(term):
@@ -74,7 +71,7 @@ def normalize_industry_term(term):
         "credit access": "fintech",
         "wealth-building": "personal finance",
         "financial inclusion": "emerging markets finance",
-        "credit scoring": "fintech"
+        "credit scoring": "fintech",
     }
     term = term.lower()
     for k, v in mapping.items():
@@ -82,7 +79,8 @@ def normalize_industry_term(term):
             return v
     return term
 
-fallback_etf_map = {
+
+FALLBACK_ETF_MAP = {
     "technology": "XLK",
     "energy": "XLE",
     "healthcare": "XLV",
@@ -98,132 +96,232 @@ fallback_etf_map = {
     "blockchain": "BLOK",
     "personal finance": "ARKF",
     "robo advisors": "BOTZ",
-    "sustainable packaging": "PKB", 
-    "aerospace": "ITA", 
+    "sustainable packaging": "PKB",
+    "aerospace": "ITA",
     "semiconductors": "SOXX",
     "cybersecurity": "CIBR",
-    "renewable energy": "ICLN", 
-    "clean energy": "PBW"
+    "renewable energy": "ICLN",
+    "clean energy": "PBW",
 }
 
-# 🔹 Step 3: GPT-4 Summary Report
-def get_business_feasibility_summary(industry, target_market, goal, budget):
-    prompt = f"""
-    Analyze the business idea below and provide a concise business feasibility summary.
-    Business Details:
-    - Industry: {industry}
-    - Target Market: {target_market}
-    - Business Goal: {goal}
-    - Estimated Budget: {budget}
-    Respond with the following sections:
-    1. Executive Summary
-    2. Market Opportunity
-    3. Key Challenges or Risks
-    4. Feasibility Assessment
-    5. Recommendation
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=500
+
+def map_industry_to_etf(industry):
+    ic = industry.lower().strip()
+    if ic in FALLBACK_ETF_MAP:
+        return FALLBACK_ETF_MAP[ic]
+    matches = get_close_matches(ic, FALLBACK_ETF_MAP.keys(), n=1, cutoff=0.7)
+    if matches:
+        return FALLBACK_ETF_MAP[matches[0]]
+    if "clean_sector" in company_sector_df.columns:
+        sector_matches = get_close_matches(
+            ic, company_sector_df["clean_sector"].str.lower().unique(), n=1, cutoff=0.7
         )
-        return response.choices[0].message.content.strip()
-    except OpenAIError as e:
-        return f"\u274c Error generating report: {e}"
+        if sector_matches and sector_matches[0] in FALLBACK_ETF_MAP:
+            return FALLBACK_ETF_MAP[sector_matches[0]]
+    return None
 
 
-# 🔹 Step 4: Static Market Data from CSV
 def get_market_insights(industry):
     df = pd.read_csv("industry_growth.csv")
-    if 'GrowthRate' not in df.columns or 'Industry' not in df.columns:
-        return "Industry data format error: Missing 'GrowthRate' or 'Industry' column.", None
-    filtered = df[df['Industry'].str.lower() == industry.lower()]
+    if "GrowthRate" not in df.columns or "Industry" not in df.columns:
+        return "Industry data format error.", None
+    filtered = df[df["Industry"].str.lower() == industry.lower()]
     if filtered.empty:
         return f"No industry insights available for '{industry}'.", df
     stats = filtered.iloc[0]
     return (
-        f"The {industry} industry has an annual growth rate of {stats['GrowthRate']}%. Key players include {stats.get('TopCompetitors', 'N/A')}", df
+        f"The {industry} industry has an annual growth rate of {stats['GrowthRate']}%. "
+        f"Key players include {stats.get('TopCompetitors', 'N/A')}",
+        df,
     )
 
 
-# 🔹 Step 5: Google Trends
 def get_google_trends(industry):
     try:
-        pytrends = TrendReq(hl='en-US', tz=360)
-        pytrends.build_payload([industry], timeframe='today 12-m')
+        pytrends = TrendReq(hl="en-US", tz=360)
+        pytrends.build_payload([industry], timeframe="today 12-m")
         time.sleep(2)
         interest = pytrends.interest_over_time()
         if interest.empty:
             return f"No trend data available for {industry}.", None
         return (
             f"Search interest in '{industry}' is {interest[industry].iloc[-1]} (last recorded week).",
-            interest
+            interest,
         )
     except Exception as e:
         return f"Google Trends error: {e}", None
 
 
-def map_industry_to_etf(industry):
-    industry_clean = industry.lower().strip()
-
-    # 1. Try direct match in fallback ETF map
-    if industry_clean in fallback_etf_map:
-        return fallback_etf_map[industry_clean]
-
-    # 2. Try fuzzy match in fallback ETF map
-    matches = get_close_matches(industry_clean, fallback_etf_map.keys(), n=1, cutoff=0.7)
-    if matches:
-        st.info(f"Fuzzy matched input **'{industry}'** to **'{matches[0]}'**, using ETF **{fallback_etf_map[matches[0]]}**.")
-        return fallback_etf_map[matches[0]]
-
-    # 3. Try match from sector CSV (inferred from company_sector_df)
-    if "clean_sector" in company_sector_df.columns:
-        sector_matches = get_close_matches(industry_clean, company_sector_df['clean_sector'].str.lower().unique(), n=1, cutoff=0.7)
-        if sector_matches:
-            sector = sector_matches[0]
-            if sector in fallback_etf_map:
-                st.info(f"Matched industry **'{industry}'** to CSV sector **'{sector}'**, using ETF **{fallback_etf_map[sector]}**.")
-                return fallback_etf_map[sector]
-
-    # 4. If nothing matched
-    st.warning(f"No ETF mapping found for **'{industry}'**. Try using a more common or broad sector name.")
-    return None
-
-
-
 def get_industry_market_summary(industry):
     ticker = map_industry_to_etf(industry)
     if not ticker:
-        return f"No ETF mapping found for '{industry}'. Try using a common sector.", None
+        return f"No ETF mapping found for '{industry}'.", None
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="6mo")
+        hist = yf.Ticker(ticker).history(period="6mo")
         if hist.empty:
-            return f"No historical data found for ETF '{ticker}'.", None
-        start_price = hist["Close"].iloc[0]
-        end_price = hist["Close"].iloc[-1]
-        change = round(((end_price - start_price) / start_price) * 100, 2)
-        return f"The {industry} sector via ETF **{ticker}** changed **{change}%** in 6 months (from ${start_price:.2f} to ${end_price:.2f}).", hist
+            return f"No historical data for ETF '{ticker}'.", None
+        start, end = hist["Close"].iloc[0], hist["Close"].iloc[-1]
+        change = round(((end - start) / start) * 100, 2)
+        return (
+            f"The {industry} sector via ETF **{ticker}** changed **{change}%** over 6 months "
+            f"(${start:.2f} → ${end:.2f}).",
+            hist,
+        )
     except Exception as e:
         return f"Error retrieving ETF data: {e}", None
 
 
-# 🔹 Step 7: NLP
-nlp = spacy.load("en_core_web_sm")
-
 def extract_keywords(text):
     doc = nlp(text)
-    return list(set(token.text for token in doc if token.pos_ in ["NOUN", "PROPN"] and not token.is_stop))
+    return list(set(t.text for t in doc if t.pos_ in ["NOUN", "PROPN"] and not t.is_stop))
 
-def extract_named_entities(text):
-    return [(ent.text, ent.label_) for ent in nlp(text).ents]
 
 def get_sentiment(text):
     return TextBlob(text).sentiment
 
-# 🔹 Step 8: Full GPT Report with Real-Time News
+
+# ── Reddit AI summary ──────────────────────────────────────────────────────────
+
+def summarize_reddit_posts(posts_meta, industry):
+    """Use GPT-4 to distil Reddit posts into structured community intelligence."""
+    if not posts_meta:
+        return None
+    posts_text = "\n\n".join(
+        f"[r/{p['subreddit']}] {p['title']}\n{p['body']}"
+        for p in posts_meta[:10]
+    )
+    prompt = f"""Analyze these Reddit discussions about the {industry} industry and provide a concise intelligence briefing:
+
+1. **Overall Sentiment** — Bullish / Bearish / Neutral with a one-line reason
+2. **Top 3 Trending Themes** — What topics dominate the conversation
+3. **Community Opportunities** — What upside the community sees
+4. **Key Risks & Concerns** — What worries are being raised
+
+Reddit data:
+{posts_text}
+
+Keep each point to 1-2 sentences. Be direct and analytical. Use the exact bold headers above."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=400,
+        )
+        return response.choices[0].message.content.strip()
+    except OpenAIError:
+        return None
+
+
+# ── Live industry growth projection ───────────────────────────────────────────
+
+def get_industry_growth_projection(industry):
+    """
+    Compute historical YoY growth from ETF data and use GPT to project
+    growth rates for the next 3 years.
+    Returns (hist_years, hist_rates, proj_years, proj_rates, outlook_text).
+    """
+    import json
+    from datetime import datetime
+
+    ticker = map_industry_to_etf(industry)
+    hist_years, hist_rates = [], []
+
+    if ticker:
+        try:
+            hist = yf.Ticker(ticker).history(period="5y")
+            if not hist.empty:
+                hist["Year"] = hist.index.year
+                annual_close = hist.groupby("Year")["Close"].last()
+                yoy = annual_close.pct_change().dropna() * 100
+                hist_years = [str(y) for y in yoy.index]
+                hist_rates = [round(float(v), 1) for v in yoy.values]
+        except Exception:
+            pass
+
+    trend_summary, _ = get_google_trends(industry)
+    news_text = "\n".join(scrape_google_news(industry)[:3])
+    hist_context = (
+        f"Historical ETF YoY returns: {dict(zip(hist_years, hist_rates))}"
+        if hist_years
+        else "No historical ETF data available."
+    )
+    current_year = datetime.now().year
+
+    prompt = f"""You are a market analyst. Based on the data below, estimate the {industry} industry's annual growth rate.
+
+Data:
+- {hist_context}
+- Google Trends signal: {trend_summary}
+- Recent news: {news_text}
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{{"current_growth": <float>, "year1": <float>, "year2": <float>, "year3": <float>, "outlook": "<2 sentence summary>"}}
+
+year1={current_year + 1}, year2={current_year + 2}, year3={current_year + 3}. All values are percentages."""
+
+    proj_years, proj_rates, outlook = [], [], ""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        text = response.choices[0].message.content.strip()
+        data = json.loads(text[text.find("{") : text.rfind("}") + 1])
+        proj_years = [str(current_year), str(current_year + 1), str(current_year + 2), str(current_year + 3)]
+        proj_rates = [
+            data.get("current_growth", 0),
+            data.get("year1", 0),
+            data.get("year2", 0),
+            data.get("year3", 0),
+        ]
+        outlook = data.get("outlook", "")
+    except Exception:
+        pass
+
+    return hist_years, hist_rates, proj_years, proj_rates, outlook
+
+
+# ── Report generators ──────────────────────────────────────────────────────────
+
+def get_business_feasibility_summary(industry, target_market, goal, budget):
+    prompt = f"""You are a startup advisor. A founder has shared this business idea:
+
+Industry: {industry}
+Idea: {goal}
+Target Market: {target_market}
+Budget: {budget}
+
+Give a concise but specific feasibility summary with these 5 sections. Everything must be specific to THIS idea — no generic advice.
+
+1. WHAT THIS BUSINESS IS
+   Plain-English description of what this does, the problem it solves, and who it serves.
+
+2. MARKET OPPORTUNITY
+   Market size estimate, key growth trends, and why the timing is right.
+
+3. REVENUE MODEL
+   How this makes money, suggested pricing, and rough unit economics (CAC, LTV).
+
+4. KEY RISKS
+   The 3 biggest specific risks for this idea and how to mitigate them.
+
+5. VERDICT & NEXT STEPS
+   Feasibility score (X/10), one critical success factor, and 3 immediate actions the founder should take this week."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=900,
+        )
+        return response.choices[0].message.content.strip()
+    except OpenAIError as e:
+        return f"❌ Error generating report: {e}"
+
+
 def generate_full_report(industry, target_market, goal, budget):
     industry = normalize_industry_term(industry)
     static_insight, _ = get_market_insights(industry)
@@ -231,312 +329,693 @@ def generate_full_report(industry, target_market, goal, budget):
     market_summary, _ = get_industry_market_summary(industry)
     news_articles = scrape_latest_business_news()
     investopedia_insight = scrape_investopedia_definition(industry)
-    # fallback check for investopedia insight
     if "Error" in investopedia_insight or "No" in investopedia_insight:
-        investopedia_insight = "No expert insight available. Please consult additional sources."
+        investopedia_insight = "No expert insight available."
     google_news = scrape_google_news(industry)
-    statista_insight = get_statista_placeholder(industry)
-    news_section = "\n".join(f"- {a['News']}" for a in news_articles[:5]) if news_articles else "No recent news available."
-    google_headlines = "\n".join(f"- {headline}" for headline in google_news)
-    reddit_posts = get_reddit_posts(industry)
+    news_section = (
+        "\n".join(f"- {a['News']}" for a in news_articles[:5])
+        if news_articles
+        else "No recent news available."
+    )
+    google_headlines = "\n".join(f"- {h}" for h in google_news)
+
+    # Pass the full business context to Reddit for relevant posts
+    reddit_posts = get_reddit_posts(industry, goal=goal, target_market=target_market)
+    st.session_state["_reddit_raw"] = reddit_posts
     reddit_db = build_vector_db_from_texts(reddit_posts)
-    reddit_context = "\n".join([doc.page_content for doc in retrieve_relevant_docs(reddit_db, industry)])
+    # Retrieve using the specific goal as the query, not just industry
+    reddit_context = "\n".join(
+        doc.page_content for doc in retrieve_relevant_docs(reddit_db, f"{industry} {goal}")
+    )
 
+    prompt = f"""You are a senior startup advisor and business strategist. A founder has come to you with a specific business idea. Your job is to produce a comprehensive, specific, and immediately actionable business plan report.
 
-    prompt = f"""
-    You are an expert AI business analyst with deep knowledge of industry trends, competitive analysis, and financial modeling.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+THE BUSINESS IDEA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Industry: {industry}
+Business Idea / Goal: {goal}
+Target Market: {target_market}
+Available Budget: {budget}
 
-    Based on the user inputs and real-world market data provided below, generate a professional and comprehensive business feasibility report. 
-    The report should be structured, detailed, and suitable for investor and stakeholder presentations.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LIVE MARKET DATA (incorporate these into your analysis)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Industry Growth: {static_insight}
+Google Trends Signal: {trend_data}
+Sector ETF Performance: {market_summary}
+Industry Definition: {investopedia_insight}
+Recent News Headlines: {google_headlines}
+Financial News: {news_section}
+Community Sentiment (Reddit): {reddit_context}
 
-    🔹 User Inputs:
-    - Industry Focus: {industry}
-    - Target Market: {target_market}
-    - Business Goal: {goal}
-    - Estimated Budget: {budget}
-    
-    🔹 Growth Rate/Market Insights:
-    {static_insight}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Generate a detailed report with EXACTLY these 10 sections. Every section must be SPECIFIC to the business idea above — never give generic advice. Reference the actual goal, market, and budget throughout.
 
-    🔹 Google Trends/Real-Time Consumer Trends:
-    {trend_data}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. BUSINESS CONCEPT OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- What this business does in 2-3 plain sentences
+- The core problem it solves and for whom (be specific about the customer pain)
+- The proposed solution and how it works
+- Unique value proposition — what makes this different from existing solutions
+- Why this idea is relevant right now (market timing)
 
-    🔹 ETF Market Behavior/ETF-Based Financial Market Analysis:
-    {market_summary}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. MARKET OPPORTUNITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Total Addressable Market (TAM) with $ estimate
+- Serviceable Addressable Market (SAM) — the realistic slice for this business
+- Serviceable Obtainable Market (SOM) — Year 1 target with reasoning
+- 3 key market trends and tailwinds supporting this business right now
+- Industry growth rate and what is driving it
 
-    🔹 Expert Insight from Investopedia:
-    {investopedia_insight}
-    
-    🔹 Statista-style Industry Summary:
-    {statista_insight}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. BUSINESS MODEL & REVENUE STREAMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Recommended revenue model (SaaS / marketplace / transactional / freemium / etc.) with justification
+- Specific pricing strategy with suggested price points
+- 2-3 revenue streams if applicable
+- Unit economics: estimated CAC (customer acquisition cost), LTV (lifetime value), gross margin %
+- How the business makes money from Day 1
 
-    🔹 Google News Headlines:
-    {google_headlines}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. FINANCIAL PROJECTIONS (12 months)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Budget allocation for {budget}:
+  - Product / Tech development: X%
+  - Marketing & customer acquisition: X%
+  - Operations & team: X%
+  - Reserve / contingency: X%
 
-    🔹 Latest Sector Headlines/Real-World Industry Headlines (scraped from financial news sites):
-    {news_section}
-    
-    🔹 Reddit & LinkedIn Trend Insight:
-    {reddit_context}   
-    
-    ✅ Please include:
-    - Competitor Overview with at least two similar startups or platforms
-    - Specific numeric assumptions in financial projections (costs, growth, breakeven)
-    - Strategic recommendations for MVP launch, capital efficiency, and user traction
+Timeline:
+  - Month 1-3: Setup costs, key hires, expected spend, early revenue potential
+  - Month 4-6: Growth targets, customer count goals, revenue range
+  - Month 7-12: Scale targets, monthly revenue goal, cumulative revenue
+  - Estimated breakeven point (month number)
+  - Projected ROI by end of month 12
 
-    📊 Report Structure:
-    1. Executive Market Summary (highlight industry scope and relevance)
-    2. SWOT Analysis (Strengths, Weaknesses, Opportunities, Threats)
-    3. Financial Forecast (3-6 month outlook, with budget assumptions)
-    4. Industry Scale and Growth Trends (macro view with statistics if possible, Industry CAGR, expansion potential, TAM/SAM/SOM)
-    5. Competitive Landscape (direct/indirect alternatives)
-    6. Tactical Recommendations (go-to-market strategy)
-    7. Pre-launch Readiness & Capital Planning (tech stack, hiring, phase rollout)
-    8. Final Assessment (Contingencies, compliance, fallback paths, is this feasible, what next?)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. COMPETITIVE LANDSCAPE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Name 3-4 direct competitors (real companies) with their weaknesses and gaps
+- How this business exploits those gaps
+- Key differentiators and sustainable competitive moat
+- Market positioning: where this business sits vs. competitors (price, features, segment)
 
-    Use a formal tone and make it suitable for investor and stakeholder presentations.
-    Use formal business tone and back insights with estimated figures where possible. Make it suitable for investors, incubators, or executive briefings.
-    """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. GO-TO-MARKET STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Exact plan to acquire the first 100 customers (step by step)
+- Top 3 acquisition channels with specific tactics for each
+- Content / community / partnership strategy
+- How to allocate the marketing portion of {budget} across channels
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. 90-DAY EXECUTION ROADMAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Week 1-2: Immediate validation steps and setup actions
+- Week 3-4: MVP definition and early build
+- Month 2: Key development milestones and first user tests
+- Month 3: Soft launch plan, beta targets, feedback loops
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. TECH STACK & OPERATIONAL REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Recommended tech stack for the MVP (tools, platforms, frameworks)
+- Minimum team required to launch (roles, whether to hire or outsource)
+- Key vendors, tools, or APIs needed
+- Compliance or regulatory requirements for this industry
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. RISKS & MITIGATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Top 4 specific risks for THIS business idea
+- Concrete mitigation plan for each risk
+- Biggest assumption that could invalidate the model and how to test it early
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. FINAL VERDICT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Feasibility Score: X/10 (with brief justification)
+- Confidence Level: High / Medium / Low
+- The 3 things the founder absolutely must get right for this to succeed
+- Recommended next 3 concrete steps to take this week
+
+Be specific, direct, and data-driven throughout. Every number, recommendation, and strategy must relate to THIS business idea, THIS target market, and THIS budget. Do not give generic startup advice."""
 
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6,
-            max_tokens=1200
+            temperature=0.5,
+            max_tokens=2800,
         )
         return response.choices[0].message.content.strip()
     except OpenAIError as e:
-        return f"\u274c Error generating full report: {e}"
+        return f"❌ Error generating full report: {e}"
 
-# (All other functions like trends chart, bar chart, Streamlit UI remain unchanged — but now this code will return actual ETF + growth rate results if the CSV and input are aligned.)
-# 🔹 Step 9: Export Report to PDF (Formatted)
-def export_to_pdf(report_content, output_file):
-    formatted_content = report_content.replace("\n", "<br>")
-    html_content = f"""
+
+# ── PDF export (in-memory, no disk write) ─────────────────────────────────────
+
+def export_to_pdf_bytes(report_text, industry):
+    formatted = report_text.replace("\n", "<br>")
+    html = f"""
     <html>
-    <head><style>body {{ font-family: Arial; padding: 30px; }}</style></head>
-    <body><h1>AI-Generated Business Feasibility Report</h1>{formatted_content}</body>
-    </html>"""
-    with open(output_file, "w+b") as f:
-        pisa_status = pisa.CreatePDF(src=html_content, dest=f)
-    return pisa_status.err
-
-# 🔹 Step 10: Charts
-def plot_trends_chart(trend_df, industry):
-    if trend_df is None or trend_df.empty:
-        st.warning("No Google Trends data to plot.")
-        return
-    try:
-        keyword_col = trend_df.columns[0]
-        fig, ax = plt.subplots()
-        trend_df[keyword_col].plot(ax=ax, title=f"Google Trends for '{keyword_col}' (12 months)", figsize=(10, 3))
-        ax.set_ylabel("Search Interest")
-        ax.set_xlabel("Date")
-        st.pyplot(fig)
-    except Exception as e:
-        st.error(f"Error in Google Trends chart: {e}")
-
-    
-def plot_etf_price_trend(hist, industry):
-    if hist is None or hist.empty:
-        st.warning("No ETF price data available.")
-        return
-    fig, ax = plt.subplots()
-    hist["Close"].plot(ax=ax, title=f"{industry.capitalize()} Sector - ETF Price Trend", figsize=(10, 3))
-    ax.set_ylabel("Price (USD)")
-    st.pyplot(fig)
+    <head><style>
+        body {{ font-family: Arial, sans-serif; padding: 32px; font-size: 12px;
+                line-height: 1.7; color: #1a1a1a; }}
+        h1 {{ color: #1f4e79; font-size: 20px; border-bottom: 2px solid #1f4e79;
+               padding-bottom: 8px; margin-bottom: 16px; }}
+        p {{ margin: 4px 0; }}
+        .meta {{ color: #555; font-size: 11px; margin-bottom: 20px; }}
+    </style></head>
+    <body>
+        <h1>AI-Generated Business Feasibility Report</h1>
+        <p class="meta"><strong>Industry:</strong> {industry}</p>
+        <hr>
+        <div>{formatted}</div>
+    </body>
+    </html>
+    """
+    buf = BytesIO()
+    pisa.CreatePDF(html, dest=buf)
+    buf.seek(0)
+    return buf
 
 
-def plot_growth_bar(df):
-    fig, ax = plt.subplots()
-    top_df = df.sort_values(by="GrowthRate", ascending=False).head(10)
-    ax.barh(top_df["Industry"], top_df["GrowthRate"])
-    ax.set_title("Top 10 Fastest-Growing Industries")
-    ax.set_xlabel("Growth Rate (%)")
-    ax.invert_yaxis()
-    st.pyplot(fig)
+# ── Chart helpers (return fig, no disk write) ──────────────────────────────────
 
-# stream lit 
-import streamlit as st
-import matplotlib.pyplot as plt
-from xhtml2pdf import pisa
+CHART_BG  = "#ffffff"
+CHART_AX  = "#f8fafc"
+BORDER    = "#e2e8f0"
+BLUE      = "#4f46e5"
+PURPLE    = "#7c3aed"
+GREEN     = "#16a34a"
+ORANGE    = "#ea580c"
+TEXT      = "#0f172a"
+MUTED     = "#64748b"
 
-st.set_page_config(page_title="AI Business Report Generator", layout="wide")
 
+def _apply_light_style(fig, ax, title):
+    fig.patch.set_facecolor(CHART_BG)
+    ax.set_facecolor(CHART_AX)
+    ax.set_title(title, color=TEXT, pad=12, fontsize=11, fontweight="bold")
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.grid(axis="y", color=BORDER, linewidth=0.7, linestyle="--", alpha=0.8)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color(BORDER)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def make_trends_chart(trend_df, industry):
+    fig, ax = plt.subplots(figsize=(10, 3.5))
+    col = trend_df.columns[0]
+    ax.plot(trend_df.index, trend_df[col], color=BLUE, linewidth=2.5)
+    ax.fill_between(trend_df.index, trend_df[col], alpha=0.1, color=BLUE)
+    ax.set_ylabel("Search Interest", color=MUTED, fontsize=9)
+    _apply_light_style(fig, ax, f"Google Search Interest — '{industry}' (12 months)")
+    plt.tight_layout()
+    return fig
+
+
+def make_etf_chart(hist, industry):
+    fig, ax = plt.subplots(figsize=(10, 3.5))
+    ax.plot(hist.index, hist["Close"], color=PURPLE, linewidth=2.5)
+    ax.fill_between(hist.index, hist["Close"].min(), hist["Close"], alpha=0.1, color=PURPLE)
+    ax.set_ylabel("Price (USD)", color=MUTED, fontsize=9)
+    _apply_light_style(fig, ax, f"{industry.title()} ETF — 6-Month Performance")
+    plt.tight_layout()
+    return fig
+
+
+def make_growth_projection_chart(hist_years, hist_rates, proj_years, proj_rates, industry):
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+
+    if hist_years and hist_rates:
+        ax.bar(
+            hist_years, hist_rates,
+            color=BLUE, alpha=0.75, label="Historical ETF YoY Return (%)",
+            width=0.5, zorder=2,
+        )
+
+    if proj_years and proj_rates:
+        ax.plot(
+            proj_years, proj_rates,
+            color=ORANGE, linewidth=2.5, marker="o", markersize=8,
+            label="GPT-4 Projected Growth (%)", linestyle="--", zorder=5,
+        )
+        for y, r in zip(proj_years, proj_rates):
+            ax.annotate(
+                f"{r:.1f}%", (y, r),
+                textcoords="offset points", xytext=(0, 11),
+                ha="center", color=ORANGE, fontsize=8, fontweight="bold",
+            )
+
+    ax.axhline(0, color="#cbd5e1", linewidth=1)
+    ax.set_ylabel("Growth / Return (%)", color=MUTED, fontsize=9)
+    ax.legend(facecolor=CHART_BG, edgecolor=BORDER, labelcolor=TEXT, fontsize=8)
+    _apply_light_style(fig, ax, f"{industry.title()} — Historical & Projected Growth Rate")
+    plt.tight_layout()
+    return fig
+
+
+# ── Streamlit config ───────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="BizGen AI — Business Report Generator",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ── Global CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Base ── */
+[data-testid="stAppViewContainer"] {
+    background: #f1f5f9 !important;
+}
+[data-testid="stHeader"] {
+    background: #ffffff !important;
+    border-bottom: 1px solid #e2e8f0;
+}
+[data-testid="stMain"], .main {
+    background: #f1f5f9 !important;
+}
+.block-container {
+    padding-top: 2.5rem;
+    max-width: 1100px;
+}
+
+/* Force readable text everywhere */
+p, li, span, div, label {
+    color: #1e293b !important;
+}
+
+/* ── Hero ── */
+.hero-wrap {
+    background: linear-gradient(135deg, #1e3a8a 0%, #4f46e5 50%, #7c3aed 100%);
+    border-radius: 20px;
+    padding: 3rem 2rem 2.5rem 2rem;
+    text-align: center;
+    margin-bottom: 2rem;
+    box-shadow: 0 4px 24px rgba(79,70,229,0.18);
+}
+.hero-title {
+    font-size: 3rem; font-weight: 900; color: #ffffff !important;
+    line-height: 1.15; margin-bottom: 0.5rem; letter-spacing: -1px;
+}
+.hero-sub {
+    color: #c7d2fe !important; font-size: 1.05rem; margin-bottom: 1.5rem;
+}
+.badges { text-align: center; }
+.badge {
+    display: inline-block;
+    background: rgba(255,255,255,0.15);
+    color: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.3);
+    border-radius: 20px;
+    padding: 5px 14px; font-size: 0.78rem; margin: 3px; font-weight: 500;
+    backdrop-filter: blur(4px);
+}
+
+/* Streamlit input overrides */
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea {
+    background: #f8fafc !important;
+    color: #0f172a !important;
+    border: 1.5px solid #cbd5e1 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stTextInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {
+    border-color: #4f46e5 !important;
+    box-shadow: 0 0 0 3px rgba(79,70,229,0.12) !important;
+}
+[data-testid="stSelectbox"] > div {
+    background: #f8fafc !important;
+    border: 1.5px solid #cbd5e1 !important;
+    border-radius: 8px !important;
+    color: #0f172a !important;
+}
+label, .stTextInput label, .stTextArea label, .stSelectbox label {
+    color: #374151 !important;
+    font-weight: 600 !important;
+    font-size: 0.88rem !important;
+}
+
+/* ── Report block ── */
+.report-block {
+    background: #ffffff;
+    color: #1e293b !important;
+    padding: 2rem 2.5rem;
+    border-radius: 16px;
+    border: 1px solid #e2e8f0;
+    line-height: 1.9;
+    font-size: 0.94rem;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.05);
+}
+.report-block * { color: #1e293b !important; }
+
+/* ── Reddit cards ── */
+.reddit-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-left: 4px solid #ff4500;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+.reddit-title { color: #0f172a !important; font-weight: 700; font-size: 0.93rem; margin-bottom: 5px; }
+.reddit-body  { color: #475569 !important; font-size: 0.84rem; margin-bottom: 8px; line-height: 1.55; }
+.reddit-meta  { color: #94a3b8 !important; font-size: 0.77rem; }
+.reddit-meta a { color: #4f46e5 !important; text-decoration: none; font-weight: 500; }
+.reddit-meta a:hover { text-decoration: underline; }
+
+/* ── Section header ── */
+.section-header {
+    color: #1e293b !important;
+    font-size: 1.25rem; font-weight: 800;
+    margin: 1.5rem 0 0.75rem 0;
+    padding-bottom: 8px;
+    border-bottom: 2px solid #4f46e5;
+    letter-spacing: -0.3px;
+}
+
+/* ── Buttons ── */
+div.stButton > button {
+    border-radius: 9px !important;
+    font-weight: 600 !important;
+    font-size: 0.9rem !important;
+    border: 1.5px solid #cbd5e1 !important;
+    background: #ffffff !important;
+    color: #374151 !important;
+    transition: all 0.18s !important;
+}
+div.stButton > button:hover {
+    border-color: #4f46e5 !important;
+    color: #4f46e5 !important;
+    box-shadow: 0 2px 8px rgba(79,70,229,0.15) !important;
+}
+div.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed) !important;
+    color: #ffffff !important;
+    border: none !important;
+    font-size: 1rem !important;
+    padding: 0.6rem 1.5rem !important;
+    box-shadow: 0 4px 14px rgba(79,70,229,0.35) !important;
+}
+div.stButton > button[kind="primary"]:hover {
+    box-shadow: 0 6px 20px rgba(79,70,229,0.45) !important;
+    color: #ffffff !important;
+}
+div.stDownloadButton > button {
+    background: linear-gradient(135deg, #16a34a, #15803d) !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 9px !important;
+    font-weight: 700 !important;
+    font-size: 0.95rem !important;
+    padding: 0.55rem 1.2rem !important;
+    box-shadow: 0 3px 10px rgba(22,163,74,0.3) !important;
+}
+
+/* ── Tabs ── */
+button[data-baseweb="tab"] {
+    font-weight: 600 !important;
+    font-size: 0.87rem !important;
+    color: #64748b !important;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    color: #4f46e5 !important;
+    border-bottom: 3px solid #4f46e5 !important;
+}
+
+/* ── Status / spinner ── */
+[data-testid="stStatusWidget"] { border-radius: 10px !important; }
+
+/* ── Captions ── */
+[data-testid="stCaptionContainer"] p { color: #64748b !important; font-size: 0.8rem !important; }
+
+hr { border-color: #e2e8f0 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session state init ─────────────────────────────────────────────────────────
 if "page" not in st.session_state:
     st.session_state.page = "Home"
 
-page = st.session_state.page
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOME PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+if st.session_state.page == "Home":
 
-# JavaScript and CSS for button styling and sound
-st.markdown("""
-    <script>
-        function playSound() {
-            var audio = new Audio("https://www.soundjay.com/buttons/sounds/button-29.mp3");
-            audio.play();
-        }
-    </script>
-    <style>
-        div.stButton > button:first-child {
-            height: 3em;
-            font-weight: bold;
-            border-radius: 8px;
-            border: none;
-            background-color: #dc3545;
-            color: white;
-            transition: all 0.3s ease;
-        }
-        div.stButton > button.enabled {
-            background-color: #28a745 !important;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-# Home Page
-if page == "Home":
     st.markdown("""
-        <h1 style='text-align: center; color: #1f4e79;'>AI-Powered Business Report Generator</h1>
-        <h4 style='text-align: center; color: #ccc;'>Generate investor-ready business reports using GPT-4 and live market data.</h4>
+        <div class='hero-wrap'>
+            <p class='hero-title'>BizGen AI</p>
+            <p class='hero-sub'>
+                Generate investor-ready business feasibility reports powered by GPT-4 and live market data.
+            </p>
+            <div class='badges'>
+                <span class='badge'>📈 Google Trends</span>
+                <span class='badge'>💹 Live ETF Data</span>
+                <span class='badge'>🤖 GPT-4 Analysis</span>
+                <span class='badge'>💬 Reddit Intelligence</span>
+                <span class='badge'>📰 News Scraping</span>
+                <span class='badge'>📄 PDF Export</span>
+            </div>
+        </div>
     """, unsafe_allow_html=True)
 
-    with st.form("report_form"):
-        st.markdown("### Enter Business Details")
-        industry = st.text_input("Industry", placeholder="e.g. Fintech")
-        target_market = st.text_input("Target Market", placeholder="e.g. Gen Z in North America")
-        goal = st.text_area("Business Goal", placeholder="Describe your product or idea")
-        budget = st.text_input("Estimated Budget", placeholder="$10,000")
-        report_type = st.selectbox("Report Type", ["Summary", "Full"])
+    _, col, _ = st.columns([1, 2.2, 1])
+    with col:
+        st.markdown("#### 🏢 Enter Business Details")
 
-        form_complete = all([industry, target_market, goal, budget])
-        submit = st.form_submit_button("Generate Report", type="primary")
+        c1, c2 = st.columns(2)
+        industry      = c1.text_input("Industry", placeholder="e.g. Fintech, SaaS, Healthcare")
+        target_market = c2.text_input("Target Market", placeholder="e.g. Gen Z in North America")
+        goal          = st.text_area("Business Goal", placeholder="Describe your product or idea", height=100)
 
-        st.markdown(f"""
-            <script>
-                const btn = window.parent.document.querySelector('button[type="submit"]');
-                if (btn) {{
-                    btn.classList.toggle("enabled", {str(form_complete).lower()});
-                }}
-            </script>
-        """, unsafe_allow_html=True)
+        c3, c4 = st.columns(2)
+        budget      = c3.text_input("Estimated Budget", placeholder="e.g. $50,000")
+        report_type = c4.selectbox("Report Type", ["Full Report", "Quick Summary"])
 
-    if submit:
-        st.session_state.generated = True
-        st.session_state.industry = industry
-        st.session_state.target_market = target_market
-        st.session_state.goal = goal
-        st.session_state.budget = budget
-        st.session_state.report_type = report_type
-        st.session_state.page = "Generated Report"
-        st.components.v1.html("<script>playSound();</script>", height=0)
-        st.rerun()
+        st.markdown("<br>", unsafe_allow_html=True)
+        submitted = st.button("Generate Report →", type="primary", use_container_width=True)
 
-# Generated Report Page
-elif page == "Generated Report" and st.session_state.get("generated"):
-    industry = st.session_state.industry
+    if submitted:
+        if not all([industry, target_market, goal, budget]):
+            st.error("Please fill in all required fields.")
+        else:
+            # Clear any previous report cache
+            for key in ["result", "trend_summary", "trend_df", "market_summary",
+                        "hist", "reddit_posts_meta", "reddit_summary",
+                        "growth_projection", "_reddit_raw"]:
+                st.session_state.pop(key, None)
+
+            st.session_state.update({
+                "page":         "Generated Report",
+                "generated":    True,
+                "industry":     industry,
+                "target_market": target_market,
+                "goal":         goal,
+                "budget":       budget,
+                "report_type":  report_type,
+            })
+            st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPORT PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif st.session_state.page == "Generated Report" and st.session_state.get("generated"):
+
+    industry     = st.session_state.industry
     target_market = st.session_state.target_market
-    goal = st.session_state.goal
-    budget = st.session_state.budget
-    report_type = st.session_state.report_type
+    goal         = st.session_state.goal
+    budget       = st.session_state.budget
+    report_type  = st.session_state.report_type
 
-    if report_type == "Summary":
-        result = get_business_feasibility_summary(industry, target_market, goal, budget)
+    # ── Top nav ───────────────────────────────────────────────────────────────
+    col_back, col_title = st.columns([1, 6])
+    with col_back:
+        if st.button("← New Report"):
+            for key in ["result", "trend_summary", "trend_df", "market_summary",
+                        "hist", "reddit_posts_meta", "reddit_summary",
+                        "growth_projection", "_reddit_raw", "generated"]:
+                st.session_state.pop(key, None)
+            st.session_state.page = "Home"
+            st.rerun()
+    with col_title:
+        st.markdown(
+            f"<h2 style='color:#4fa3e0; margin:0; padding-top:4px;'>"
+            f"📊 {industry.title()} — Business Feasibility Report</h2>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # ── Generate report once, cache result ────────────────────────────────────
+    if "result" not in st.session_state:
+        with st.status("Generating your report...", expanded=True) as status:
+            st.write("🔍 Scraping news and market data...")
+            st.write("📡 Fetching Google Trends and ETF performance...")
+            st.write("💬 Gathering Reddit community insights...")
+            st.write("🤖 Running GPT-4 analysis...")
+
+            if report_type.startswith("Full"):
+                result = generate_full_report(industry, target_market, goal, budget)
+            else:
+                result = get_business_feasibility_summary(industry, target_market, goal, budget)
+
+            st.session_state.result = result
+            status.update(label="Report ready!", state="complete", expanded=False)
     else:
-        result = generate_full_report(industry, target_market, goal, budget)
+        result = st.session_state.result
 
-    formatted_result = result.replace('\n', '<br>')
-    st.markdown("""
-        <style>
-            .report-block {
-                background-color: #0e1117;
-                color: #f0f2f6;
-                padding: 1.5em;
-                border-radius: 12px;
-                border: 1px solid #444;
-            }
-        </style>
-    """, unsafe_allow_html=True)
-    st.markdown("<h2 style='color:#1f4e79;'>Business Report</h2>", unsafe_allow_html=True)
-    st.markdown(f"<div class='report-block'>{formatted_result}</div>", unsafe_allow_html=True)
+    # ── Report display ────────────────────────────────────────────────────────
+    st.markdown("<p class='section-header'>Report</p>", unsafe_allow_html=True)
+    formatted = result.replace("\n", "<br>")
+    st.markdown(f"<div class='report-block'>{formatted}</div>", unsafe_allow_html=True)
 
-    # Visual Market Insights Tabs
+    # ── PDF download (in-memory, no disk write) ───────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    pdf_bytes = export_to_pdf_bytes(result, industry)
+    st.download_button(
+        label="⬇ Download PDF Report",
+        data=pdf_bytes,
+        file_name=f"{industry.lower().replace(' ', '_')}_report.pdf",
+        mime="application/pdf",
+    )
+
     st.markdown("---")
-    st.markdown("<h3 style='color:#1f4e79;'>Visual Market Insights</h3>", unsafe_allow_html=True)
-    tabs = st.tabs(["📈 Google Trends", "💹 ETF Price Trend", "📊 Industry Growth",  "💬 Reddit Trends"])
+    st.markdown("<p class='section-header'>Visual Market Insights</p>", unsafe_allow_html=True)
 
-    # Tab 1: Google Trends
+    tabs = st.tabs(["📈 Google Trends", "💹 ETF Performance", "📊 Industry Growth", "💬 Reddit Community Pulse"])
+
+    # ── Tab 1 — Google Trends ─────────────────────────────────────────────────
     with tabs[0]:
-        trend_summary, trend_df = get_google_trends(industry)
-        st.markdown(f"*Google Trends Summary*: {trend_summary}")
-        if trend_df is not None:
-            fig1, ax1 = plt.subplots()
-            trend_df[trend_df.columns[0]].plot(ax=ax1, title=f"Google Trends for {industry}")
-            st.pyplot(fig1)
-            fig1.savefig("trend_chart.png")
+        if "trend_df" not in st.session_state:
+            with st.spinner("Loading trend data..."):
+                summary, df = get_google_trends(industry)
+                st.session_state.trend_summary = summary
+                st.session_state.trend_df = df
+        else:
+            summary = st.session_state.trend_summary
+            df      = st.session_state.trend_df
 
-    # Tab 2: ETF Market Behavior
+        st.caption(f"📊 {summary}")
+        if df is not None and not df.empty:
+            fig = make_trends_chart(df, industry)
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("No Google Trends data available for this industry.")
+
+    # ── Tab 2 — ETF Performance ───────────────────────────────────────────────
     with tabs[1]:
-        market_summary, hist = get_industry_market_summary(industry)
-        st.markdown(f"*ETF Market Summary*: {market_summary}")
-        if hist is not None:
-            fig2, ax2 = plt.subplots()
-            hist["Close"].plot(ax=ax2, title=f"ETF Price Trend - {industry}")
-            st.pyplot(fig2)
-            fig2.savefig("etf_chart.png")
+        if "hist" not in st.session_state:
+            with st.spinner("Loading ETF data..."):
+                mkt_summary, hist = get_industry_market_summary(industry)
+                st.session_state.market_summary = mkt_summary
+                st.session_state.hist = hist
+        else:
+            mkt_summary = st.session_state.market_summary
+            hist        = st.session_state.hist
 
-    # Tab 3: Industry Growth Rate
+        st.caption(f"💹 {mkt_summary}")
+        if hist is not None and not hist.empty:
+            fig = make_etf_chart(hist, industry)
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("No ETF data available for this industry.")
+
+    # ── Tab 3 — Industry Growth (live scrape + GPT projection) ───────────────
     with tabs[2]:
-        _, growth_df = get_market_insights(industry)
-        if growth_df is not None:
-            fig3, ax3 = plt.subplots()
-            top_df = growth_df.sort_values(by="GrowthRate", ascending=False).head(10)
-            ax3.barh(top_df["Industry"], top_df["GrowthRate"])
-            ax3.set_title("Top 10 Growing Industries")
-            ax3.invert_yaxis()
-            st.pyplot(fig3)
-            fig3.savefig("growth_chart.png")
-            
-    # Tab 4: Reddit Trends
+        if "growth_projection" not in st.session_state:
+            with st.spinner("Scraping market data and projecting growth..."):
+                hy, hr, py, pr, outlook = get_industry_growth_projection(industry)
+                st.session_state.growth_projection = (hy, hr, py, pr, outlook)
+        else:
+            hy, hr, py, pr, outlook = st.session_state.growth_projection
+
+        if outlook:
+            st.markdown(f"**Market Outlook:** {outlook}")
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        if hy or py:
+            fig = make_growth_projection_chart(hy, hr, py, pr, industry)
+            st.pyplot(fig)
+            plt.close(fig)
+            st.caption(
+                "Blue bars = historical ETF year-over-year return (proxy for sector growth). "
+                "Orange dashed line = GPT-4 projected growth rate."
+            )
+        else:
+            st.info(f"Could not compute growth data for '{industry}'. Try a broader industry name.")
+
+    # ── Tab 4 — Reddit Community Pulse ────────────────────────────────────────
     with tabs[3]:
-        reddit_posts = get_reddit_posts(industry)
-        reddit_db = build_vector_db_from_texts(reddit_posts)
-        reddit_context = "\n".join([doc.page_content for doc in retrieve_relevant_docs(reddit_db, industry)])
-        st.markdown(f"*Reddit Trends*: {reddit_context}")
-    st.markdown("---")
-    st.markdown("<h3 style='color:#1f4e79;'>Download Report</h3>", unsafe_allow_html=True)      
-    st.markdown("Click the button below to download your report as a PDF.")
-    st.markdown("This report includes charts and insights based on your inputs.")
-    st.markdown("**Note**: The report is generated based on the latest data available and may include estimates.")
-    st.markdown("**Disclaimer**: This report is for informational purposes only and should not be considered financial advice.")
+        if "reddit_posts_meta" not in st.session_state:
+            with st.spinner("Fetching and analysing Reddit community discussions..."):
+                posts_meta = get_reddit_posts_with_metadata(industry, goal=goal, target_market=target_market)
+                st.session_state.reddit_posts_meta = posts_meta
+                reddit_summary = summarize_reddit_posts(posts_meta, industry)
+                st.session_state.reddit_summary = reddit_summary
+        else:
+            posts_meta     = st.session_state.reddit_posts_meta
+            reddit_summary = st.session_state.get("reddit_summary")
 
-    # Export to PDF
-    def export_to_pdf(report_text, file_name):
-        formatted_text = report_text.replace("\n", "<br>")
-        html_content = f"""
-        <html>
-        <body>
-            <h1>AI-Generated Business Report</h1>
-            <div>{formatted_text}</div>
-            <img src='trend_chart.png'><br>
-            <img src='growth_chart.png'><br>
-            <img src='etf_chart.png'><br>
-        </body>
-        </html>
-        """
-        with open(file_name, "w+b") as f:
-            pisa.CreatePDF(html_content, dest=f)
+        # GPT summary at the top
+        if reddit_summary:
+            st.markdown(
+                f"<div class='report-block' style='margin-bottom:1.5rem;'>{reddit_summary.replace(chr(10), '<br>')}</div>",
+                unsafe_allow_html=True,
+            )
 
-    # st.markdown("### Download Report")
-    export_to_pdf(result, "business_report.pdf")
-    with open("business_report.pdf", "rb") as f:
-        st.download_button("Download PDF with Charts", f, "business_report.pdf", mime="application/pdf")
+        if posts_meta:
+            st.markdown(
+                f"**{len(posts_meta)} source discussions** from Reddit about *{industry}*",
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            for p in posts_meta:
+                if p["score"] >= 100:
+                    dot = "🟢"
+                elif p["score"] >= 20:
+                    dot = "🟡"
+                else:
+                    dot = "🔴"
+                body_html = f"<div class='reddit-body'>{p['body']}</div>" if p["body"] else ""
+                st.markdown(
+                    f"""
+                    <div class='reddit-card'>
+                        <div class='reddit-title'>{p['title']}</div>
+                        {body_html}
+                        <div class='reddit-meta'>
+                            {dot}&nbsp; r/{p['subreddit']}
+                            &nbsp;·&nbsp; ▲ {p['score']} upvotes
+                            &nbsp;·&nbsp; 💬 {p['comments']} comments
+                            &nbsp;·&nbsp; <a href='{p['url']}' target='_blank'>View on Reddit ↗</a>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No Reddit posts found for this industry.")
 
-    # Back button
-    if st.button("Back to Home"):
-        st.session_state.page = "Home"
-        st.rerun()
-
-# Fallback
+# ── Fallback ───────────────────────────────────────────────────────────────────
 else:
-    st.info("Please generate a report from the Home page first.")
-    
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.info("No report generated yet. Please go to the Home page to get started.")
+        if st.button("Go to Home →", type="primary", use_container_width=True):
+            st.session_state.page = "Home"
+            st.rerun()

@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pdf
+trend_chart.png
+etf_chart.png
+growth_chart.png
+.DS_Store
